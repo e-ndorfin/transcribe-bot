@@ -1,3 +1,17 @@
+# Project local files
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+recordings/
+asr_server/.venv/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.uv-cache/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
