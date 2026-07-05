@@ -203,6 +203,11 @@ Keep both `TRANSCRIBE_CONCURRENCY` and `ASR_MAX_CONCURRENCY` at `1` unless the A
 
 The bot tracks at most one active recording per Discord server. If `/record` is run again in the same voice channel, the existing session is reused. If it is run in a different voice channel in the same server, the bot rejects the request until the active session stops.
 
+## Limitations
+
+- One active voice channel per Discord server. A single bot account only tracks one active recording session per guild. If another user runs `/record` in the same voice channel, the bot keeps using the existing session. If another user runs `/record` from a different voice channel in the same server, the bot rejects the request instead of moving channels or starting a second recording. Recording multiple channels in the same server at the same time would need an explicit multi-session design, likely with multiple bot connections or bot accounts.
+- No true model-side batch inference. The bot can send multiple HTTP transcription requests when `TRANSCRIBE_CONCURRENCY` is greater than `1`, and the ASR server can allow multiple concurrent model calls when `ASR_MAX_CONCURRENCY` is greater than `1`, but those are parallel requests, not one batched model invocation. True batching was not added because it would add server and API complexity, and the expected performance difference may be negligible for this local workflow. That expectation has not been verified; the real bottleneck may be audio encode/decode, file I/O, model inference, or request overhead.
+
 ## ASR Server Contract
 
 The bot sends multipart `POST` requests to `TRANSCRIBE_URL` with:
