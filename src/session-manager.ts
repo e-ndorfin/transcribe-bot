@@ -7,6 +7,7 @@ import {
   type GuildBasedChannel,
   type GuildMember,
   type GuildTextBasedChannel,
+  type Message,
   type Snowflake,
   type VoiceBasedChannel,
   type VoiceState
@@ -24,16 +25,19 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { Transform, type TransformCallback } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import prism from "prism-media";
+import OpusScript from "opusscript";
 import { UserVisibleError } from "./errors.js";
+import { summarizeTranscriptWithCodex, type SummaryArtifacts } from "./summarizer.js";
 import { transcribeWav, type TranscriptionResult } from "./transcriber.js";
 
 const PCM_RATE = 48_000;
 const PCM_CHANNELS = 2;
-const PCM_FRAME_SIZE = 960;
 const SPEAKING_END_SILENCE_MS = 1_000;
 const READY_TIMEOUT_MS = 20_000;
+const RECORDING_PROGRESS_INTERVAL_MS = 15_000;
+const DISCORD_PROGRESS_EDIT_INTERVAL_MS = 5_000;
 
 export type RecordingManagerOptions = {
   client: Client;
@@ -42,6 +46,12 @@ export type RecordingManagerOptions = {
   transcribeTimeoutMs: number;
   transcribeConcurrency: number;
   ffmpegPath: string;
+  codexSummaryEnabled: boolean;
+  codexPath: string;
+  codexSummaryTimeoutMs: number;
+  codexPythonVenvPath?: string;
+  pandocPath: string;
+  pandocPdfEngine: string;
 };
 
 type StopReason = "manual" | "empty-channel" | "shutdown";
@@ -79,6 +89,7 @@ type SegmentRecording = {
   pcmPath: string;
   wavPath: string;
   bytes: number;
+  decodeErrors: number;
 };
 
 type RecordingSession = {
@@ -96,6 +107,33 @@ type RecordingSession = {
   nextSegmentIndex: number;
   speakingListener: (userId: Snowflake) => void;
   stopping: boolean;
+  progress: RecordingProgress;
+};
+
+type RecordingProgress = {
+  snapshot: ProgressSnapshot;
+  message?: Message;
+  timer?: ReturnType<typeof setInterval>;
+  lastContent?: string;
+  lastEditAt: number;
+  editQueue: Promise<void>;
+};
+
+type ProgressStage =
+  | "recording"
+  | "stopping"
+  | "converting"
+  | "transcribing"
+  | "writing"
+  | "summarizing"
+  | "complete"
+  | "failed";
+
+type ProgressSnapshot = {
+  stage: ProgressStage;
+  completed?: number;
+  total?: number;
+  detail?: string;
 };
 
 type SegmentArtifact = {
@@ -107,6 +145,7 @@ type SegmentArtifact = {
   pcmPath: string;
   wavPath: string;
   bytes: number;
+  decodeErrors: number;
   transcription: TranscriptionResult;
 };
 
@@ -119,8 +158,19 @@ type StopResult = {
   session: RecordingSession;
   artifacts: SegmentArtifact[];
   transcriptPath: string;
+  summary?: SummaryResult;
   reason: StopReason;
 };
+
+type SummaryResult =
+  | {
+      ok: true;
+      artifacts: SummaryArtifacts;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
 
 type TimelineEntry = {
   startMs: number;
@@ -193,11 +243,17 @@ export class RecordingManager {
       segments: [],
       nextSegmentIndex: 0,
       speakingListener: (userId) => this.handleSpeakingStart(session, userId),
-      stopping: false
+      stopping: false,
+      progress: {
+        snapshot: { stage: "recording" },
+        lastEditAt: 0,
+        editQueue: Promise.resolve()
+      }
     };
 
     connection.receiver.speaking.on("start", session.speakingListener);
     this.sessions.set(guildId, session);
+    await this.startSessionProgress(session);
 
     return `Recording started in ${channelMention(session.channelId)}. Speak for a few seconds, then use \`/stop\` to test the WAV/transcript path.`;
   }
@@ -214,29 +270,76 @@ export class RecordingManager {
 
     session.stopping = true;
     this.sessions.delete(guildId);
+    this.stopSessionProgressTimer(session);
     session.connection.receiver.speaking.off("start", session.speakingListener);
 
-    for (const speaker of session.speakers.values()) {
-      for (const stream of speaker.streams) {
-        stream.opus.destroy();
-        stream.decoder.destroy();
-        stream.writer.destroy();
+    try {
+      await this.updateSessionProgress(
+        session,
+        {
+          stage: "stopping",
+          detail: "Closing audio streams and waiting for pending writes."
+        },
+        { force: true }
+      );
+
+      for (const speaker of session.speakers.values()) {
+        for (const stream of speaker.streams) {
+          stream.opus.destroy();
+          stream.decoder.destroy();
+          stream.writer.destroy();
+        }
       }
+
+      await Promise.allSettled(
+        [...session.speakers.values()].flatMap((speaker) => [...speaker.pipelines])
+      );
+
+      session.connection.destroy();
+
+      const artifacts = await this.finalizeSegments(session);
+      await this.updateSessionProgress(
+        session,
+        {
+          stage: "writing",
+          completed: artifacts.length,
+          total: artifacts.length,
+          detail: "Writing transcript files."
+        },
+        { force: true }
+      );
+
+      const transcriptPath = await this.writeTranscript(session, artifacts, reason);
+      const summary = await this.summarizeTranscript(session, artifacts, transcriptPath);
+      const result: StopResult = { session, artifacts, transcriptPath, summary, reason };
+
+      await this.postStopResult(result);
+      await this.updateSessionProgress(
+        session,
+        {
+          stage: "complete",
+          completed: artifacts.length,
+          total: artifacts.length,
+          detail:
+            summary?.ok === true
+              ? `Transcript and ${summary.artifacts.pdfFileName} posted to ${channelMention(session.textChannelId)}.`
+              : `Transcript posted to ${channelMention(session.textChannelId)}.`
+        },
+        { force: true }
+      );
+
+      return result;
+    } catch (error) {
+      await this.updateSessionProgress(
+        session,
+        {
+          stage: "failed",
+          detail: error instanceof Error ? error.message : String(error)
+        },
+        { force: true }
+      );
+      throw error;
     }
-
-    await Promise.allSettled(
-      [...session.speakers.values()].flatMap((speaker) => [...speaker.pipelines])
-    );
-
-    session.connection.destroy();
-
-    const artifacts = await this.finalizeSegments(session);
-    const transcriptPath = await this.writeTranscript(session, artifacts, reason);
-    const result: StopResult = { session, artifacts, transcriptPath, reason };
-
-    await this.postStopResult(result);
-
-    return result;
   }
 
   status(guildId: Snowflake): string {
@@ -254,6 +357,129 @@ export class RecordingManager {
       `Started by <@${session.startedByUserId}>.`,
       `${speakerCount} speaker(s), ${segmentCount} segment(s) captured so far.`
     ].join(" ");
+  }
+
+  private async startSessionProgress(session: RecordingSession): Promise<void> {
+    await this.updateSessionProgress(session, { stage: "recording" }, { force: true });
+
+    session.progress.timer = setInterval(() => {
+      void this.updateSessionProgress(session, { stage: "recording" });
+    }, RECORDING_PROGRESS_INTERVAL_MS);
+    session.progress.timer.unref?.();
+  }
+
+  private stopSessionProgressTimer(session: RecordingSession): void {
+    if (!session.progress.timer) {
+      return;
+    }
+
+    clearInterval(session.progress.timer);
+    session.progress.timer = undefined;
+  }
+
+  private async updateSessionProgress(
+    session: RecordingSession,
+    snapshot: Partial<ProgressSnapshot>,
+    options: { force?: boolean } = {}
+  ): Promise<void> {
+    session.progress.snapshot = {
+      ...session.progress.snapshot,
+      ...snapshot
+    };
+
+    const content = renderProgressMessage(session);
+    const now = Date.now();
+    const contentChanged = content !== session.progress.lastContent;
+    const canEdit =
+      options.force ||
+      !session.progress.message ||
+      (contentChanged && now - session.progress.lastEditAt >= DISCORD_PROGRESS_EDIT_INTERVAL_MS);
+
+    if (!canEdit) {
+      return;
+    }
+
+    console.log(renderProgressLogLine(session));
+    session.progress.lastContent = content;
+    session.progress.lastEditAt = now;
+
+    const editOperation = session.progress.editQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const channel = await this.options.client.channels.fetch(session.textChannelId).catch(() => undefined);
+        if (!channel || !channel.isTextBased() || channel.isDMBased()) {
+          return;
+        }
+
+        if (!session.progress.message) {
+          session.progress.message = await channel.send({ content });
+          return;
+        }
+
+        await session.progress.message.edit({ content });
+      })
+      .catch((error: unknown) => {
+        console.warn("Failed to update Discord progress message:", error);
+      });
+
+    session.progress.editQueue = editOperation;
+
+    if (options.force) {
+      await editOperation;
+    }
+  }
+
+  private async summarizeTranscript(
+    session: RecordingSession,
+    artifacts: SegmentArtifact[],
+    transcriptPath: string
+  ): Promise<SummaryResult | undefined> {
+    if (!this.options.codexSummaryEnabled) {
+      return undefined;
+    }
+
+    const hasTranscriptText = artifacts.some(
+      (artifact) => artifact.transcription.ok && artifact.transcription.text.trim().length > 0
+    );
+    if (!hasTranscriptText) {
+      return {
+        ok: false,
+        error: "No successful transcription text was available to summarize."
+      };
+    }
+
+    await this.updateSessionProgress(
+      session,
+      {
+        stage: "summarizing",
+        detail: "Calling Codex to create meeting-summary.docx and a date-named summary PDF."
+      },
+      { force: true }
+    );
+
+    try {
+      const summaryArtifacts = await summarizeTranscriptWithCodex({
+        transcriptPath,
+        outputDir: session.dir,
+        codexPath: this.options.codexPath,
+        codexTimeoutMs: this.options.codexSummaryTimeoutMs,
+        codexPythonVenvPath: this.options.codexPythonVenvPath,
+        pandocPath: this.options.pandocPath,
+        pandocPdfEngine: this.options.pandocPdfEngine
+      });
+
+      return {
+        ok: true,
+        artifacts: summaryArtifacts
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Failed to create Codex summary PDF for ${session.guildId}/${session.channelId}: ${message}`);
+      return {
+        ok: false,
+        error: message
+      };
+    }
   }
 
   async stopAll(reason: StopReason): Promise<void> {
@@ -318,12 +544,17 @@ export class RecordingManager {
         duration: SPEAKING_END_SILENCE_MS
       }
     });
-    const decoder = new prism.opus.Decoder({
-      frameSize: PCM_FRAME_SIZE,
-      channels: PCM_CHANNELS,
-      rate: PCM_RATE
-    });
     const segment = this.createSegment(session, speaker);
+    const decoder = new TolerantOpusDecoder((error, skippedPackets) => {
+      segment.decodeErrors += 1;
+
+      if (skippedPackets === 1 || skippedPackets % 25 === 0) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(
+          `Skipped undecodable Opus packet for ${member.user.tag} segment ${segment.index} (${skippedPackets} skipped): ${message}`
+        );
+      }
+    });
     const writer = createWriteStream(segment.pcmPath, { flags: "wx" });
     const streamState: SpeakerStream = { opus, decoder, writer, segment };
 
@@ -382,7 +613,8 @@ export class RecordingManager {
       startMs,
       pcmPath: path.join(session.dir, `${baseName}.pcm`),
       wavPath: path.join(session.dir, `${baseName}.wav`),
-      bytes: 0
+      bytes: 0,
+      decodeErrors: 0
     };
 
     session.segments.push(segment);
@@ -391,12 +623,32 @@ export class RecordingManager {
 
   private async finalizeSegments(session: RecordingSession): Promise<SegmentArtifact[]> {
     const preparedSegments: PreparedSegment[] = [];
+    const segmentCount = session.segments.length;
 
+    await this.updateSessionProgress(
+      session,
+      {
+        stage: "converting",
+        completed: 0,
+        total: segmentCount,
+        detail: segmentCount === 0 ? "No captured segments to convert." : "Preparing WAV files for ASR."
+      },
+      { force: true }
+    );
+
+    let convertedSegments = 0;
     for (const segment of session.segments) {
       const fileStats = await stat(segment.pcmPath).catch(() => undefined);
       const bytes = fileStats?.size ?? segment.bytes;
 
       if (bytes <= 0) {
+        convertedSegments += 1;
+        await this.updateSessionProgress(session, {
+          stage: "converting",
+          completed: convertedSegments,
+          total: segmentCount,
+          detail: `Skipped empty segment ${segment.index}.`
+        });
         continue;
       }
 
@@ -407,18 +659,41 @@ export class RecordingManager {
       });
 
       preparedSegments.push({ segment, bytes });
+      convertedSegments += 1;
+      await this.updateSessionProgress(session, {
+        stage: "converting",
+        completed: convertedSegments,
+        total: segmentCount,
+        detail: `Converted segment ${segment.index}.`
+      });
     }
 
+    let transcribedSegments = 0;
     const artifacts = await mapWithConcurrency(
       preparedSegments,
       this.options.transcribeConcurrency,
       async ({ segment, bytes }) => {
+        await this.updateSessionProgress(session, {
+          stage: "transcribing",
+          completed: transcribedSegments,
+          total: preparedSegments.length,
+          detail: `Transcribing segment ${segment.index} from ${segment.label}.`
+        });
+
         const transcription = await transcribeWav({
           url: this.options.transcribeUrl,
           wavPath: segment.wavPath,
           speaker: segment.label,
           userId: segment.userId,
           timeoutMs: this.options.transcribeTimeoutMs
+        });
+
+        transcribedSegments += 1;
+        await this.updateSessionProgress(session, {
+          stage: "transcribing",
+          completed: transcribedSegments,
+          total: preparedSegments.length,
+          detail: `Finished segment ${segment.index}.`
         });
 
         return {
@@ -430,6 +705,7 @@ export class RecordingManager {
           pcmPath: segment.pcmPath,
           wavPath: segment.wavPath,
           bytes,
+          decodeErrors: segment.decodeErrors,
           transcription
         };
       }
@@ -479,8 +755,10 @@ export class RecordingManager {
 
     for (const artifact of artifacts) {
       const endText = artifact.endMs === undefined ? "unknown" : formatClock(artifact.endMs);
+      const decodeText =
+        artifact.decodeErrors > 0 ? ` (${artifact.decodeErrors} undecodable Opus packet(s) skipped)` : "";
       lines.push(
-        `${formatClock(artifact.startMs)}-${endText} ${artifact.label} (${artifact.userId}) segment ${artifact.index}: ${artifact.wavPath}`
+        `${formatClock(artifact.startMs)}-${endText} ${artifact.label} (${artifact.userId}) segment ${artifact.index}${decodeText}: ${artifact.wavPath}`
       );
     }
 
@@ -499,14 +777,25 @@ export class RecordingManager {
     const transcribedCount = artifacts.filter((artifact) => artifact.transcription.ok).length;
     const speakerCount = new Set(artifacts.map((artifact) => artifact.userId)).size;
     const reasonText = result.reason === "empty-channel" ? "the channel became empty" : result.reason;
+    const summaryText =
+      result.summary?.ok === true
+        ? ` Summary PDF attached: \`${result.summary.artifacts.pdfFileName}\`.`
+        : result.summary?.ok === false
+          ? ` Summary PDF was not created: ${result.summary.error}`
+          : "";
     const content =
       artifacts.length === 0
         ? `Recording stopped because ${reasonText}, but no speaker audio was captured. Transcript notes attached.`
-        : `Recording stopped because ${reasonText}. Captured ${artifacts.length} segment(s) from ${speakerCount} speaker(s); ${transcribedCount} transcription(s) succeeded. Transcript attached.`;
+        : `Recording stopped because ${reasonText}. Captured ${artifacts.length} segment(s) from ${speakerCount} speaker(s); ${transcribedCount} transcription(s) succeeded. Transcript attached.${summaryText}`;
+    const files = [new AttachmentBuilder(result.transcriptPath)];
+
+    if (result.summary?.ok === true) {
+      files.push(new AttachmentBuilder(result.summary.artifacts.pdfPath));
+    }
 
     await channel.send({
       content,
-      files: [new AttachmentBuilder(result.transcriptPath)]
+      files
     });
   }
 }
@@ -548,6 +837,31 @@ async function convertPcmToWav(options: {
   });
 }
 
+class TolerantOpusDecoder extends Transform {
+  private readonly decoder = new OpusScript(PCM_RATE, PCM_CHANNELS, OpusScript.Application.AUDIO);
+  private skippedPackets = 0;
+
+  constructor(private readonly onDecodeError: (error: unknown, skippedPackets: number) => void) {
+    super();
+  }
+
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback): void {
+    try {
+      this.push(this.decoder.decode(chunk));
+    } catch (error) {
+      this.skippedPackets += 1;
+      this.onDecodeError(error, this.skippedPackets);
+    }
+
+    callback();
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.decoder.delete();
+    callback(error);
+  }
+}
+
 function requireGuildTextChannel(interaction: ChatInputCommandInteraction): GuildTextBasedChannel {
   const channel = interaction.channel;
   if (!channel || !("guild" in channel) || !channel.isTextBased() || channel.isDMBased()) {
@@ -563,6 +877,91 @@ function isVoiceBasedGuildChannel(channel: GuildBasedChannel | null | undefined)
 
 function channelMention(channelId: Snowflake): string {
   return `<#${channelId}>`;
+}
+
+function renderProgressMessage(session: RecordingSession): string {
+  const snapshot = session.progress.snapshot;
+  const elapsedSeconds = Math.round(elapsedMs(session) / 1_000);
+  const speakerCount = session.speakers.size;
+  const segmentCount = session.segments.length;
+  const progressBar = renderProgressBar(snapshot.completed, snapshot.total);
+  const lines = [
+    `Voice transcript progress for ${channelMention(session.channelId)}`,
+    `Status: ${progressStageLabel(snapshot.stage)}`,
+    `Elapsed: ${formatDuration(elapsedSeconds)} | Speakers: ${speakerCount} | Segments: ${segmentCount}`
+  ];
+
+  if (progressBar) {
+    lines.push(progressBar);
+  }
+
+  if (snapshot.detail) {
+    lines.push(clampProgressText(snapshot.detail));
+  }
+
+  return lines.join("\n").slice(0, 1_900);
+}
+
+function renderProgressLogLine(session: RecordingSession): string {
+  const snapshot = session.progress.snapshot;
+  const elapsedSeconds = Math.round(elapsedMs(session) / 1_000);
+  const progressText =
+    snapshot.total && snapshot.total > 0
+      ? ` ${Math.min(snapshot.completed ?? 0, snapshot.total)}/${snapshot.total}`
+      : "";
+  const detail = snapshot.detail ? ` - ${clampProgressText(snapshot.detail, 220)}` : "";
+
+  return [
+    `[${new Date().toISOString()}]`,
+    `[${session.guildId}/${session.channelId}]`,
+    `${progressStageLabel(snapshot.stage)}${progressText}`,
+    `elapsed=${formatDuration(elapsedSeconds)}`,
+    `speakers=${session.speakers.size}`,
+    `segments=${session.segments.length}${detail}`
+  ].join(" ");
+}
+
+function renderProgressBar(completed: number | undefined, total: number | undefined): string | undefined {
+  if (total === undefined || total <= 0) {
+    return undefined;
+  }
+
+  const safeCompleted = Math.min(Math.max(0, completed ?? 0), total);
+  const width = 20;
+  const filled = Math.round((safeCompleted / total) * width);
+  const percent = Math.round((safeCompleted / total) * 100);
+
+  return `\`[${"#".repeat(filled)}${"-".repeat(width - filled)}] ${safeCompleted}/${total} (${percent}%)\``;
+}
+
+function progressStageLabel(stage: ProgressStage): string {
+  switch (stage) {
+    case "recording":
+      return "Recording";
+    case "stopping":
+      return "Stopping";
+    case "converting":
+      return "Converting audio";
+    case "transcribing":
+      return "Transcribing";
+    case "writing":
+      return "Writing transcript";
+    case "summarizing":
+      return "Summarizing";
+    case "complete":
+      return "Complete";
+    case "failed":
+      return "Failed";
+  }
+}
+
+function clampProgressText(value: string, maxLength = 240): string {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= maxLength) {
+    return singleLine;
+  }
+
+  return `${singleLine.slice(0, maxLength - 3)}...`;
 }
 
 function formatTimestamp(date: Date): string {
@@ -641,6 +1040,7 @@ function buildSegmentMetadata(artifacts: SegmentArtifact[]): Array<Record<string
     pcmPath: artifact.pcmPath,
     wavPath: artifact.wavPath,
     bytes: artifact.bytes,
+    decodeErrors: artifact.decodeErrors,
     transcriptionOk: artifact.transcription.ok,
     transcriptionError: artifact.transcription.error,
     text: artifact.transcription.text,

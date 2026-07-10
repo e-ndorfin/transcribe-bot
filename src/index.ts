@@ -5,7 +5,7 @@ import {
   MessageFlags,
   type ChatInputCommandInteraction
 } from "discord.js";
-import { env, nonNegativeNumberEnv, numberEnv } from "./env.js";
+import { booleanEnv, env, nonNegativeNumberEnv, numberEnv } from "./env.js";
 import { UserVisibleError } from "./errors.js";
 import { RecordingManager } from "./session-manager.js";
 
@@ -19,7 +19,13 @@ const manager = new RecordingManager({
   transcribeUrl: env("TRANSCRIBE_URL", "http://127.0.0.1:8000/transcribe"),
   transcribeTimeoutMs: nonNegativeNumberEnv("TRANSCRIBE_TIMEOUT_MS", 7_200_000),
   transcribeConcurrency: numberEnv("TRANSCRIBE_CONCURRENCY", 1),
-  ffmpegPath: env("FFMPEG_PATH", "ffmpeg")
+  ffmpegPath: env("FFMPEG_PATH", "ffmpeg"),
+  codexSummaryEnabled: booleanEnv("CODEX_SUMMARY_ENABLED", true),
+  codexPath: env("CODEX_PATH", "codex"),
+  codexSummaryTimeoutMs: nonNegativeNumberEnv("CODEX_SUMMARY_TIMEOUT_MS", 900_000),
+  codexPythonVenvPath: env("CODEX_PYTHON_VENV", ".venv"),
+  pandocPath: env("PANDOC_PATH", "pandoc"),
+  pandocPdfEngine: env("PANDOC_PDF_ENGINE", "xelatex")
 });
 
 client.once(Events.ClientReady, (readyClient) => {
@@ -100,7 +106,7 @@ async function handleStop(interaction: ChatInputCommandInteraction): Promise<voi
   }
 
   await interaction.editReply(
-    `Stopped recording in <#${result.session.channelId}>. Transcript artifact posted in this channel.`
+    `Stopped recording in <#${result.session.channelId}>. Transcript and summary artifacts posted in this channel.`
   );
 }
 

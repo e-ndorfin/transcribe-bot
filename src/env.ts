@@ -43,3 +43,20 @@ export function nonNegativeNumberEnv(name: string, fallback: number): number {
 
   return parsed;
 }
+
+export function booleanEnv(name: string, fallback: boolean): boolean {
+  const value = optionalEnv(name);
+  if (!value) {
+    return fallback;
+  }
+
+  const normalized = value.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  throw new Error(`Environment variable ${name} must be a boolean.`);
+}
