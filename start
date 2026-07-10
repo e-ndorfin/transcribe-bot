@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION_NAME="${TMUX_SESSION_NAME:-transcribe-bot}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR_Q="$(printf '%q' "$ROOT_DIR")"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required. Install it with: brew install tmux" >&2
+  exit 1
+fi
+
+attach_session() {
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$SESSION_NAME"
+  else
+    tmux attach-session -t "$SESSION_NAME"
+  fi
+}
+
+window_exists() {
+  tmux list-windows -t "$SESSION_NAME" -F "#{window_name}" | grep -Fxq "$1"
+}
+
+pane_is_idle() {
+  case "$1" in
+    bash|fish|login|sh|zsh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_pane_running() {
+  local pane="$1"
+  local title="$2"
+  local command="$3"
+  local current_command
+
+  tmux select-pane -t "$pane" -T "$title"
+  current_command="$(tmux display-message -p -t "$pane" "#{pane_current_command}")"
+
+  if pane_is_idle "$current_command"; then
+    tmux send-keys -t "$pane" "cd $ROOT_DIR_Q && $command" C-m
+    echo "Started $title pane: $command"
+  else
+    echo "$title pane already running: $current_command"
+  fi
+}
+
+ensure_servers_window() {
+  local target="$SESSION_NAME:servers"
+  local pane_count
+
+  if ! window_exists "servers"; then
+    tmux new-window -d -t "$SESSION_NAME:" -n servers -c "$ROOT_DIR"
+  fi
+
+  pane_count="$(tmux list-panes -t "$target" -F "#{pane_index}" | wc -l | tr -d ' ')"
+  if [[ "$pane_count" -lt 2 ]]; then
+    tmux split-window -h -t "$target.0" -c "$ROOT_DIR"
+  fi
+
+  ensure_pane_running "$target.0" "bot" "npm run dev"
+  ensure_pane_running "$target.1" "asr" "npm run asr:dev"
+
+  tmux select-layout -t "$target" even-horizontal
+  tmux select-pane -t "$target.0"
+  tmux select-window -t "$target"
+}
+
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "Using existing tmux session: $SESSION_NAME"
+  ensure_servers_window
+  attach_session
+  exit 0
+fi
+
+tmux new-session -d -s "$SESSION_NAME" -n servers -c "$ROOT_DIR"
+ensure_servers_window
+
+echo "Started tmux session: $SESSION_NAME"
+attach_session
