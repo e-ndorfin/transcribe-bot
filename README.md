@@ -1,251 +1,245 @@
 # Transcribe Bot
 
-Discord voice transcription bot spike. The bot joins a voice channel, records each speaker into timestamped audio segments, sends those segments to a local speech-to-text service, and posts a transcript artifact back to Discord.
-
-The included ASR server is intended for local Apple Silicon development with `parakeet-mlx` and the `mlx-community/parakeet-tdt-0.6b-v3` model.
-
-## Current Features
-
-- Guild-scoped slash commands for fast development: `/record`, `/stop`, and `/status`.
-- One active recording session per Discord server.
-- Per-speaker, per-speaking-burst audio segments.
-- WAV conversion with ffmpeg.
-- Chronological `transcript.txt` output.
-- Debuggable `segments.json` output beside each transcript.
-- Optional local Parakeet MLX ASR server under `asr_server/`.
-
-## Prerequisites
-
-- Node.js 20 or newer.
-- npm.
-- ffmpeg available on `PATH`.
-- `uv` for the Python ASR server.
-- A Discord server where you can install a test bot.
-- For the included ASR server: macOS on Apple Silicon is recommended.
-
-On macOS, the common system dependencies can be installed with:
-
-```bash
-brew install node ffmpeg uv
-```
-
-## Create and Install the Discord Bot
-
-1. Open the Discord Developer Portal:
-   <https://discord.com/developers/applications>
-
-2. Click **New Application**, give it a name, and open the new application.
-
-3. Copy the application ID:
-   - Go to **General Information**.
-   - Copy **Application ID**.
-   - This becomes `DISCORD_CLIENT_ID`.
-
-4. Create a bot token:
-   - Go to **Bot**.
-   - Click **Reset Token** or **View Token**.
-   - Put the token in your local `.env` as `DISCORD_TOKEN`.
-   - Do not commit or paste the token anywhere public.
-
-5. Check bot intent settings:
-   - The current bot uses `Guilds` and `GuildVoiceStates`.
-   - Message content intent is not required.
-   - Server members intent is not required for the current MVP.
-
-6. Build the install URL:
-   - Go to **OAuth2** -> **URL Generator**.
-   - Select scopes: `bot` and `applications.commands`.
-   - Select bot permissions:
-     - View Channels
-     - Send Messages
-     - Attach Files
-     - Connect
-     - Speak
-     - Use Voice Activity
-   - Open the generated URL and install the bot into your test server.
-
-   The equivalent permission integer is `36736000`, so this URL shape also works after replacing `YOUR_CLIENT_ID`:
-
-```text
-https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=36736000&integration_type=0&scope=bot%20applications.commands
-```
-
-7. Copy your Discord server ID:
-   - In Discord, enable **User Settings** -> **Advanced** -> **Developer Mode**.
-   - Right-click your test server icon.
-   - Click **Copy Server ID**.
-   - This becomes `DISCORD_GUILD_IDS`.
+Personal Discord voice transcription bot.
 
 ## Local Setup
 
-1. Install JavaScript dependencies:
+1. Install dependencies:
 
 ```bash
 npm install
+uv sync
 ```
 
-2. Create your local environment file:
+2. Add the non-secret IDs to your existing `.env`:
 
 ```bash
-cp .env.example .env
+DISCORD_CLIENT_ID=1523313450766434344
+DISCORD_GUILD_IDS=1492005523665719306,1417675827432259604
+DISCORD_GUILD_LABELS=personal testing,deployment
+TRANSCRIBE_URL=http://127.0.0.1:8000/transcribe
+CODEX_SUMMARY_ENABLED=true
 ```
 
-3. Fill in the required Discord values in `.env`:
+The `DISCORD_CLIENT_ID`, `DISCORD_GUILD_IDS`, and guild labels shown above are purely example values from one test deployment. Discord client and guild IDs are public, non-secret identifiers, but you must replace these examples with the IDs for your own Discord application and servers.
 
-```bash
-DISCORD_TOKEN=your_bot_token_here
-DISCORD_CLIENT_ID=your_application_id_here
-DISCORD_GUILD_IDS=your_test_server_id_here
+Keep your existing `DISCORD_TOKEN=...` in `.env`. Do not commit `.env`.
+
+3. Invite the bot to your Discord server if you have not already:
+
+```text
+https://discord.com/oauth2/authorize?client_id=YOUR_DISCORD_CLIENT_ID&permissions=36736000&integration_type=0&scope=bot%20applications.commands
 ```
 
-For multiple test servers, use comma-separated guild IDs:
+This invite URL is only a template and will not work unchanged. Replace `YOUR_DISCORD_CLIENT_ID` with your own Discord application client ID before opening it.
 
-```bash
-DISCORD_GUILD_IDS=111111111111111111,222222222222222222
-DISCORD_GUILD_LABELS=local test,staging
-```
-
-`DISCORD_GUILD_LABELS` is optional. If used, it must have one comma-separated label per guild ID.
-
-4. Register slash commands:
+4. Register slash commands in a server:
 
 ```bash
 npm run deploy
 ```
 
-If multiple guild IDs are configured, the deploy script prompts you to choose one guild or all guilds. To skip the prompt:
+If multiple guild IDs are configured, this prompts you to choose `personal testing`, `deployment`, or all configured guilds. To skip the prompt, set `DISCORD_DEPLOY_GUILD_ID` for that command:
 
 ```bash
-DISCORD_DEPLOY_GUILD_ID=your_test_server_id_here npm run deploy
+DISCORD_DEPLOY_GUILD_ID=1417675827432259604 npm run deploy
 ```
 
-5. Start the local ASR server in one terminal:
-
-```bash
-npm run asr:dev
-```
-
-The first run downloads the Parakeet MLX model, which can take a while. After startup, verify the server with:
-
-```bash
-npm run asr:health
-```
-
-6. Start the Discord bot in another terminal:
+5. Start the bot:
 
 ```bash
 npm run dev
 ```
 
-For a compiled run instead:
+The bot runtime is not pinned to one guild. Once slash commands are registered and the bot is installed in both servers, one `npm run dev` process can handle interactions in both.
+
+6. In another terminal, start the local Parakeet ASR server:
 
 ```bash
-npm run build
-npm start
+npm run asr:dev
 ```
 
-7. Test the full path in Discord:
-   - Join a normal voice channel.
-   - Run `/record` in a server text channel.
-   - Speak for a few seconds.
-   - Run `/status` if you want to confirm the active session.
-   - Run `/stop`.
-   - Confirm that the bot posts `transcript.txt` back to the text channel.
-
-Local artifacts are written under:
-
-```text
-recordings/<guildId>/<sessionTimestamp>-<voiceChannelId>/
-```
-
-Each session directory can contain `.pcm` files, `.wav` files, `segments.json`, and `transcript.txt`.
-
-## Environment Variables
-
-| Variable | Required | Default | Notes |
-| --- | --- | --- | --- |
-| `DISCORD_TOKEN` | Yes | None | Bot token from the Discord Developer Portal. Keep this secret. |
-| `DISCORD_CLIENT_ID` | Yes for deploy | None | Discord application ID. |
-| `DISCORD_GUILD_IDS` | Yes for deploy | None | One or more Discord server IDs, comma or whitespace separated. |
-| `DISCORD_GUILD_ID` | No | None | Backward-compatible single-guild alternative to `DISCORD_GUILD_IDS`. |
-| `DISCORD_GUILD_LABELS` | No | None | Optional comma-separated labels for deploy prompts. |
-| `DISCORD_DEPLOY_GUILD_ID` | No | None | Optional deploy-time override. Use a guild ID or `all`. |
-| `TRANSCRIBE_URL` | No | `http://127.0.0.1:8000/transcribe` | ASR endpoint. Set to `off`, `disabled`, or `none` to skip transcription while keeping recordings. |
-| `RECORDINGS_DIR` | No | `recordings` | Directory for local audio and transcript artifacts. |
-| `FFMPEG_PATH` | No | `ffmpeg` | ffmpeg executable path. |
-| `TRANSCRIBE_TIMEOUT_MS` | No | `7200000` | Bot-side HTTP timeout per segment. Use `0` to disable. |
-| `TRANSCRIBE_CONCURRENCY` | No | `1` | Number of segment WAVs the bot sends to ASR at the same time. |
-| `PARAKEET_MODEL` | No | `mlx-community/parakeet-tdt-0.6b-v3` | Model used by the included ASR server. |
-| `PARAKEET_CACHE_DIR` | No | None | Optional model cache directory. |
-| `PARAKEET_CHUNK_DURATION` | No | `120` | ASR processing window in seconds. Use `0` to disable chunking. |
-| `PARAKEET_OVERLAP_DURATION` | No | `15` | ASR overlap in seconds when chunking is enabled. |
-| `ASR_MAX_CONCURRENCY` | No | `1` | Number of concurrent Parakeet MLX inference calls in the ASR server. |
-
-Keep both `TRANSCRIBE_CONCURRENCY` and `ASR_MAX_CONCURRENCY` at `1` unless the ASR implementation changes. The current server does not do true model batching; higher values create parallel model calls.
+ASR is also guild-agnostic; it only receives audio files from the bot. The first transcription will download the MLX Parakeet model and may take a while. After that, the model is cached locally.
 
 ## Commands
 
 - `/record` starts recording the voice channel you are currently in.
 - `/status` shows the active recording session for the server.
-- `/stop` stops the active recording session and posts the transcript artifact.
+- `/stop` stops the active recording session and posts a transcript artifact plus a Codex-generated date-named summary PDF when summary generation succeeds.
 
-## Runtime Model
+While a recording is active, the bot keeps an editable progress message in the Discord text channel. It shows elapsed time, speaker count, segment count, and then conversion/transcription progress after the recording stops. The same progress updates are also printed in the bot terminal.
 
-1. A user runs `/record` from a server text channel while connected to a normal voice channel.
-2. The bot joins that voice channel with voice receive enabled.
-3. Discord speaking events are used to create one segment per speaker burst.
-4. Each segment is written as PCM audio during the call.
-5. `/stop`, process shutdown, or an empty voice channel ends the session.
-6. Non-empty PCM files are converted to WAV with ffmpeg.
-7. WAV files are posted to `TRANSCRIBE_URL`.
-8. The bot builds a chronological transcript and posts `transcript.txt`.
-9. `segments.json` is preserved locally for debugging and later timeline improvements.
+## Pipeline
 
-The bot tracks at most one active recording per Discord server. If `/record` is run again in the same voice channel, the existing session is reused. If it is run in a different voice channel in the same server, the bot rejects the request until the active session stops.
+1. You run `/record`.
+   The bot checks which voice channel you are currently in. If it is not already recording in that server, it joins that channel with voice receive enabled.
 
-## Limitations
+2. The bot starts listening for speakers.
+   Discord emits a speaking-start event when a user starts talking. For each non-bot user in the tracked voice channel, the bot subscribes to that user's audio stream.
 
-- One active voice channel per Discord server. A single bot account only tracks one active recording session per guild. If another user runs `/record` in the same voice channel, the bot keeps using the existing session. If another user runs `/record` from a different voice channel in the same server, the bot rejects the request instead of moving channels or starting a second recording. Recording multiple channels in the same server at the same time would need an explicit multi-session design, likely with multiple bot connections or bot accounts.
-- No true model-side batch inference. The bot can send multiple HTTP transcription requests when `TRANSCRIBE_CONCURRENCY` is greater than `1`, and the ASR server can allow multiple concurrent model calls when `ASR_MAX_CONCURRENCY` is greater than `1`, but those are parallel requests, not one batched model invocation. True batching was not added because it would add server and API complexity, and the expected performance difference may be negligible for this local workflow. That expectation has not been verified; the real bottleneck may be audio encode/decode, file I/O, model inference, or request overhead.
+3. The bot records per-speaker, per-segment audio.
+   Each speaking burst becomes one segment. A segment starts when Discord says the user started speaking and ends after about one second of silence.
 
-## ASR Server Contract
+4. The bot writes raw audio during the call.
+   During recording, each segment is written as a `.pcm` file inside:
 
-The bot sends multipart `POST` requests to `TRANSCRIBE_URL` with:
+```text
+recordings/<guildId>/<sessionTimestamp>-<voiceChannelId>/
+```
 
-- `file`: WAV file.
-- `speaker`: Discord display name.
-- `userId`: Discord user ID.
+   The bot also tracks metadata such as speaker, user ID, segment start time, and segment end time.
 
-The transcription service may return plain text or JSON. Supported JSON text fields are `text`, `transcript`, `output`, or `result`.
+5. You run `/stop`, or everyone leaves.
+   `/stop` manually stops the session. If everyone leaves the voice channel, the bot auto-stops.
 
-The included server returns JSON shaped like:
+6. The bot finalizes segment files.
+   It closes active audio streams, waits for pending writes, then converts every non-empty `.pcm` segment into a `.wav` file using ffmpeg.
+
+7. The bot sends each segment WAV to ASR.
+   For each segment WAV, the bot sends a POST request to:
+
+```text
+http://127.0.0.1:8000/transcribe
+```
+
+   The bot sends up to `TRANSCRIBE_CONCURRENCY` segment requests at a time. The ASR server runs Parakeet MLX and returns text plus sentence timestamps when available. The reliable default is one request at a time.
+
+8. The bot builds a chronological transcript.
+   The bot offsets Parakeet's segment-relative timestamps by the segment's actual call start time, then sorts all transcript entries by timestamp.
+
+```text
+00:00 alice: hi how are you?
+00:02 bob: i'm great
+00:04 alice: sorry for interrupting
+00:05 bob: no worries
+```
+
+9. The bot posts artifacts back to Discord.
+   It sends `transcript.txt` to the text channel. It also writes `segments.json` locally with detailed segment metadata, including WAV paths and timing data.
+
+During steps 6-10, the progress message switches from live recording status to an ASCII progress bar for audio conversion and ASR transcription, then shows the Codex summary step.
+
+10. The bot asks Codex to create meeting notes.
+    After `transcript.txt` is written, the bot runs `codex exec` in the recording session directory. Codex is prompted to use its documents/Word/PDF tooling when available and create `meeting-summary.docx` plus a date-named PDF such as `jul7.pdf`, with an executive summary, meeting-minutes topic sections, decisions, action items, and open questions. The summary document omits recording metadata such as guild, channel, start/stop time, speaker count, segment count, user IDs, and segment file paths. The bot verifies the PDF exists and attaches it to Discord. If Codex cannot create the Word/PDF files, the bot falls back to a Markdown summary plus local pandoc conversion.
+
+## Codex Summary PDF
+
+The summary step uses your local Codex CLI login, not OpenAI API credits. Make sure this works in the same terminal/user account that runs the bot:
+
+```bash
+codex exec --ephemeral --skip-git-repo-check --sandbox read-only -C /tmp "Say ready."
+```
+
+Required local tools:
+
+- `codex` for summary generation.
+- `pandoc` for the fallback DOCX/PDF conversion path.
+- A pandoc PDF engine such as `xelatex`.
+
+Summary-related `.env` settings:
+
+```bash
+CODEX_SUMMARY_ENABLED=true
+CODEX_PATH=codex
+CODEX_SUMMARY_TIMEOUT_MS=900000
+CODEX_PYTHON_VENV=.venv
+PANDOC_PATH=pandoc
+PANDOC_PDF_ENGINE=xelatex
+```
+
+`CODEX_PYTHON_VENV=.venv` points spawned Codex runs at the repo-local uv environment. The bot prepends `.venv/bin` to `PATH`, sets `VIRTUAL_ENV`, and tells Codex to use `.venv/bin/python` for document-generation Python modules such as `python-docx`.
+
+The spawned Codex prompt explicitly asks Codex to use the `$documents` skill/plugin first. Seeing `soffice` in the Codex log is expected when that path is active: the documents renderer uses LibreOffice headless for DOCX/PDF visual verification. If LibreOffice headless aborts locally, Codex can still create the DOCX and PDF through the available local fallback tools.
+
+Set `CODEX_SUMMARY_ENABLED=false` to disable the automatic summary PDF. Generated summary files are saved beside the transcript in:
+
+```text
+recordings/<guildId>/<sessionTimestamp>-<voiceChannelId>/
+```
+
+## Tests
+
+Run the default test suite with:
+
+```bash
+npm test
+```
+
+The summary integration test defaults to this recorded transcript fixture:
+
+```text
+/Users/zachary/Desktop/coding/transcribe-bot/recordings/1492005523665719306/2026-07-07T19-16-10-561Z-1492005524298928143
+```
+
+It uses fake `codex` and `pandoc` binaries, so it is fast and does not spend a Codex run. It still exercises the same summary orchestration and catches path regressions in the DOCX/PDF fallback path.
+
+To test a different recording directory:
+
+```bash
+SUMMARY_TEST_RECORDING_DIR=/path/to/recording npm test
+```
+
+To run the slower live integration with real Codex and pandoc, without doing a Discord recording:
+
+```bash
+npm run test:summary:live
+```
+
+The live test keeps its output PDF here by default, named from the transcript's `Started at` date:
+
+```text
+test-output/summary-live/jul7.pdf
+```
+
+## Transcription Server Contract
+
+The bot posts each segment WAV file to `TRANSCRIBE_URL` as multipart form data:
+
+- `file`: WAV file
+- `speaker`: display name
+- `userId`: Discord user ID
+
+The transcription service can return either plain text or JSON with one of these fields:
 
 ```json
 {
-  "text": "transcript here",
-  "speaker": "display name",
-  "userId": "123456789012345678",
-  "model": "mlx-community/parakeet-tdt-0.6b-v3",
-  "sentences": [
-    {
-      "text": "transcript here",
-      "start": 0.0,
-      "end": 1.2,
-      "duration": 1.2
-    }
-  ]
+  "text": "transcript here"
 }
 ```
 
-## Troubleshooting
+Accepted JSON text fields are `text`, `transcript`, `output`, or `result`. If the local transcription server is not running, the bot still saves WAV files and posts a transcript file noting the failure.
 
-- Slash commands do not show up: run `npm run deploy` again for the correct guild ID, then restart or reload Discord.
-- The bot cannot join voice: check channel permission overrides for View Channel and Connect.
-- The bot cannot post the transcript: check Send Messages and Attach Files in the text channel.
-- `ffmpeg` fails: install ffmpeg or set `FFMPEG_PATH` to the full executable path.
-- ASR is not ready: start `npm run asr:dev` and check `npm run asr:health`.
-- You only want to test Discord recording: set `TRANSCRIBE_URL=off` and run `/record` followed by `/stop`.
+This repo includes a compatible server at [asr_server/server.py](asr_server/server.py). It uses `parakeet-mlx` with `mlx-community/parakeet-tdt-0.6b-v3` by default. You can check it with:
 
-## Public Repo Hygiene
+```bash
+npm run asr:health
+```
 
-Do not commit local secrets or generated artifacts. `.gitignore` excludes `.env`, dependency folders, build output, recordings, Python virtualenvs, and cache files. Use `.env.example` for shareable configuration shape only.
+For long calls, `PARAKEET_CHUNK_DURATION=120` is an internal ASR processing window, not a hard transcript cutoff. Parakeet MLX processes long files in overlapping windows and merges the token output. `PARAKEET_OVERLAP_DURATION=15` gives each neighboring window shared context at the boundary.
+
+Set `PARAKEET_CHUNK_DURATION=0` only if you explicitly want Parakeet MLX to process the whole audio file at once. That is not recommended for hour-long calls because it can use much more memory.
+
+`TRANSCRIBE_TIMEOUT_MS=7200000` gives each speaker transcription request up to two hours. Set it to `0` to disable the bot-side HTTP timeout.
+
+`TRANSCRIBE_CONCURRENCY=1` controls how many segment WAVs the Discord bot sends to the ASR server at once. `ASR_MAX_CONCURRENCY=1` controls how many Parakeet MLX inference calls the ASR server runs at once.
+
+The current ASR server does not do true deep-learning batch inference. Higher values here create parallel HTTP/model calls, not one batched model call. Local testing with `ASR_MAX_CONCURRENCY=2`, `4`, and `8` crashed the Parakeet MLX process with exit code 139, so keep both defaults at `1` unless the ASR implementation changes.
+
+True batching would require a different ASR endpoint that accepts multiple segment files and a transcription implementation that can run them as one batched model invocation.
+
+## Recording Notes
+
+Recordings are saved under `recordings/`. The bot tracks one active recording per Discord server/guild. It will not silently move from one voice channel to another while recording.
+
+The recorder splits each speaker into timestamped speaking segments. A segment starts when Discord reports that user speaking, and ends after about one second of silence. This makes the final transcript chronological instead of grouped by speaker:
+
+```text
+00:00 alice: hi how are you?
+00:02 bob: i'm great
+00:04 alice: oh that's great, sorry for interrupting you
+00:05 bob: today's day is really good. no worries
+```
+
+Overlapping speakers remain separate because Discord provides per-user audio streams. The bot writes `segments.json` next to `transcript.txt` with segment start/end times, source WAV paths, and transcription metadata.
+
+The first important test is whether Discord voice receive works: start `/record`, speak for a few seconds, run `/stop`, and confirm non-empty segment WAV files are produced.
